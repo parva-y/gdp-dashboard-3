@@ -51,7 +51,7 @@ def parse_dates(df, date_col='Date'):
 def aggregate_weekly(df, date_col='Date'):
     df = df.copy()
     df['WeekStart'] = df[date_col] - pd.to_timedelta(df[date_col].dt.dayofweek, unit='d')
-    agg = df.groupby('WeekStart').sum().reset_index().rename(columns={'WeekStart': 'Date'})
+    agg = df.groupby('WeekStart').sum(numeric_only=True).reset_index().rename(columns={'WeekStart': 'Date'})
     return agg
 
 
@@ -85,8 +85,17 @@ def bootstrap_diff(pre, camp, n_boot=2000):
 
 
 def ols_with_controls(y, X):
-    Xc = add_constant(X)
-    model = sm.OLS(y, Xc).fit(cov_type='HAC', cov_kwds={'maxlags':7})
+    # Ensure all inputs are numeric and handle any remaining issues
+    y_clean = pd.to_numeric(y, errors='coerce')
+    X_clean = X.apply(pd.to_numeric, errors='coerce')
+    
+    # Drop rows with NaN
+    valid_mask = y_clean.notna() & X_clean.notna().all(axis=1)
+    y_clean = y_clean[valid_mask]
+    X_clean = X_clean[valid_mask]
+    
+    Xc = add_constant(X_clean)
+    model = sm.OLS(y_clean.astype(float), Xc.astype(float)).fit(cov_type='HAC', cov_kwds={'maxlags':7})
     return model
 
 # ----------------------------
@@ -170,23 +179,24 @@ if num_spend_na > 0:
 DF = pd.merge(searches, spends[['Date', 'Spend']], on='Date', how='left')
 DF['Spend'] = DF['Spend'].fillna(0)
 
-# Ensure remaining non-date columns are numeric; coerce if needed and stop if any remain non-numeric
+# CRITICAL FIX: Ensure ALL non-Date columns are numeric
 for c in DF.columns:
     if c == 'Date':
         continue
-    if DF[c].dtype == 'O':
-        try:
-            DF[c] = safe_to_numeric(DF[c])
-            st.info(f'Coerced {c} to numeric.')
-        except Exception:
-            st.warning(f'Could not coerce column {c}; it remains object dtype.')
+    DF[c] = pd.to_numeric(DF[c], errors='coerce')
 
+# Fill any remaining NaNs with 0 (or you could drop these rows)
+numeric_cols = [c for c in DF.columns if c != 'Date']
+DF[numeric_cols] = DF[numeric_cols].fillna(0)
+
+# Final dtype check
 problem_cols = [c for c in DF.columns if c != 'Date' and not np.issubdtype(DF[c].dtype, np.number)]
 if len(problem_cols) > 0:
     st.error('The following columns are still non-numeric and will break numeric ops: ' + ', '.join(problem_cols))
+    st.dataframe(DF[problem_cols].head())
     st.stop()
 
-st.success('Data cleaning complete — numeric types OK.')
+st.success('Data cleaning complete — all numeric columns verified.')
 
 # weekly toggle
 st.sidebar.header('Settings')
@@ -239,30 +249,6 @@ alpha = st.sidebar.number_input('Significance alpha', min_value=0.001, max_value
 # ----------------------------
 # Tabs
 # ----------------------------
-
-# Determine campaign period (prefer explicit 27 Sep 2025 start if present, else autodetect where Spend>0)
-try:
-    user_campaign_start = pd.to_datetime('2025-09-27', dayfirst=True)
-except Exception:
-    user_campaign_start = pd.to_datetime('2025-09-27')
-
-idxs_after = DF.index[DF['Date'] >= user_campaign_start].tolist()
-if len(idxs_after) > 0:
-    start_idx = idxs_after[0]
-    spend_after = DF.loc[start_idx:, 'Spend']
-    if (spend_after > 0).any():
-        end_idx = int(spend_after[spend_after > 0].index.max())
-    else:
-        end_idx = len(DF) - 1
-    st.sidebar.success(f'Using user campaign start: {DF.loc[start_idx, "Date"].date()} -> {DF.loc[end_idx, "Date"].date()}')
-else:
-    start_idx, end_idx = detect_campaign(DF['Spend'])
-    if start_idx is None:
-        st.warning('No campaign spend detected (all spends are 0). App will still show correlations and diagnostics.')
-    else:
-        camp_start_date = DF.loc[start_idx, 'Date']
-        camp_end_date = DF.loc[end_idx, 'Date']
-        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')
 
 tabs = st.tabs(['Overview & Plot','Pre vs Campaign','ITS / Regression','DiD & Controls','Correlations & Lags','Interpretation'])
 
@@ -317,9 +303,9 @@ with tabs[2]:
 
     # add controls
     for c in controls:
-        X[c] = DF[c]
+        X[c] = DF[c].values
 
-    y = DF[outcome]
+    y = DF[outcome].values
 
     model = ols_with_controls(y, X)
     st.subheader('Model summary (HAC SE)')
@@ -333,7 +319,10 @@ with tabs[2]:
         st.write(f'Campaign coefficient = {coef:.2f} (se {se:.2f}), p = {p:.4f}')
 
     # plot fitted vs actual
-    DF['fitted'] = model.fittedvalues
+    fitted_full = pd.Series(index=DF.index, dtype=float)
+    fitted_full.loc[model.fittedvalues.index] = model.fittedvalues.values
+    DF['fitted'] = fitted_full
+    
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name='Actual'))
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
@@ -345,27 +334,32 @@ with tabs[2]:
 with tabs[3]:
     st.header('Difference-in-Differences style check & Controls')
     # Create a synthetic control by averaging controls
-    DF['controls_mean'] = DF[controls].mean(axis=1)
-    if start_idx is not None:
-        pre_mean_outcome = DF.loc[:start_idx-1, outcome].mean()
-        camp_mean_outcome = DF.loc[start_idx:end_idx, outcome].mean()
-        pre_mean_ctrl = DF.loc[:start_idx-1, 'controls_mean'].mean()
-        camp_mean_ctrl = DF.loc[start_idx:end_idx, 'controls_mean'].mean()
-        st.write('Raw pre vs campaign means (outcome vs controls_mean)')
-        st.write(pd.DataFrame({'metric': ['pre_outcome','camp_outcome','pre_ctrl','camp_ctrl'], 'value':[pre_mean_outcome,camp_mean_outcome,pre_mean_ctrl,camp_mean_ctrl]}))
+    if len(controls) > 0:
+        DF['controls_mean'] = DF[controls].mean(axis=1)
+        if start_idx is not None:
+            pre_mean_outcome = DF.loc[:start_idx-1, outcome].mean()
+            camp_mean_outcome = DF.loc[start_idx:end_idx, outcome].mean()
+            pre_mean_ctrl = DF.loc[:start_idx-1, 'controls_mean'].mean()
+            camp_mean_ctrl = DF.loc[start_idx:end_idx, 'controls_mean'].mean()
+            st.write('Raw pre vs campaign means (outcome vs controls_mean)')
+            st.write(pd.DataFrame({'metric': ['pre_outcome','camp_outcome','pre_ctrl','camp_ctrl'], 'value':[pre_mean_outcome,camp_mean_outcome,pre_mean_ctrl,camp_mean_ctrl]}))
 
-    st.subheader('Regression using competitor controls only')
-    Xc = add_constant(DF[['controls_mean']])
-    mod_ctrl = sm.OLS(DF[outcome], Xc).fit()
-    st.text(mod_ctrl.summary())
+        st.subheader('Regression using competitor controls only')
+        Xc = add_constant(DF[['controls_mean']])
+        mod_ctrl = sm.OLS(DF[outcome].astype(float), Xc.astype(float)).fit()
+        st.text(mod_ctrl.summary())
+    else:
+        st.info('No controls selected')
 
 # Correlations & Lags
 with tabs[4]:
     st.header('Correlations, cross-correlation & lag analysis')
     st.subheader('Correlation matrix (outcome + controls)')
-    corr_df = DF[[outcome]+controls].corr()
-    st.dataframe(corr_df)
-    st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), use_container_width=True)
+    corr_cols = [outcome] + controls
+    if len(corr_cols) > 1:
+        corr_df = DF[corr_cols].corr()
+        st.dataframe(corr_df)
+        st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), use_container_width=True)
 
     st.subheader('Cross-correlation (lag) between Spend and Outcome)')
     maxlag = int(max_lag)
@@ -377,19 +371,20 @@ with tabs[4]:
 
     # Granger causality on top competitors
     try:
-        st.subheader('Granger causality tests (top controls)')
-        top_controls = list(DF[controls].corrwith(DF[outcome]).abs().sort_values(ascending=False).index[:5])
-        gc_results = {}
-        from statsmodels.tsa.stattools import grangercausalitytests
-        for ctl in top_controls:
-            test_df = DF[[outcome, ctl]].dropna()
-            try:
-                res = grangercausalitytests(test_df[[outcome, ctl]], maxlag=min(7, maxlag), verbose=False)
-                pvals = [res[l][0]['ssr_ftest'][1] for l in res]
-                gc_results[ctl] = pvals
-            except Exception as e:
-                gc_results[ctl] = str(e)
-        st.write(gc_results)
+        if len(controls) > 0:
+            st.subheader('Granger causality tests (top controls)')
+            top_controls = list(DF[controls].corrwith(DF[outcome]).abs().sort_values(ascending=False).index[:5])
+            gc_results = {}
+            from statsmodels.tsa.stattools import grangercausalitytests
+            for ctl in top_controls:
+                test_df = DF[[outcome, ctl]].dropna()
+                try:
+                    res = grangercausalitytests(test_df[[outcome, ctl]], maxlag=min(7, maxlag), verbose=False)
+                    pvals = [res[l][0]['ssr_ftest'][1] for l in res]
+                    gc_results[ctl] = pvals
+                except Exception as e:
+                    gc_results[ctl] = str(e)
+            st.write(gc_results)
     except Exception as e:
         st.write('Granger tests failed: ', e)
 

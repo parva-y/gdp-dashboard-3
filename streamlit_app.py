@@ -219,9 +219,7 @@ else:
     else:
         camp_start_date = DF.loc[start_idx, 'Date']
         camp_end_date = DF.loc[end_idx, 'Date']
-        st.sidebar.success(
-    f"Auto-detected campaign: {camp_start_date.date()} → {camp_end_date.date()}"
-)
+        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')} -> {camp_end_date.date()}')
 
 # columns
 st.sidebar.markdown('**Columns detected**')
@@ -325,22 +323,50 @@ with tabs[2]:
 
     y = DF[outcome]
 
-    model = ols_with_controls(y, X)
-    st.subheader('Model summary (HAC SE)')
-    st.text(model.summary())
+    # Ensure numeric types for outcome and regressors, drop rows with unresolved NaNs before fitting
+# Coerce y and X to numeric (safest) and align rows
+y = DF[outcome].copy()
+X = X.copy()
+# coerce
+try:
+    y = pd.to_numeric(y, errors='coerce')
+    X = X.apply(lambda col: pd.to_numeric(col, errors='coerce'))
+except Exception as _e:
+    st.error('Error coercing columns to numeric: '+str(_e))
+    st.stop()
+# drop rows with NaNs in y or any X column (in practice this is rare after cleaning)
+mask = (~y.isna()) & (~X.isna().any(axis=1))
+if mask.sum() == 0:
+    st.error('After coercion there are no rows left to fit the model. Check your data for non-numeric values.')
+    st.stop()
 
-    # coefficient for campaign
-    if 'campaign' in model.params.index:
-        coef = model.params['campaign']
-        se = model.bse['campaign']
-        p = model.pvalues['campaign']
-        st.write(f'Campaign coefficient = {coef:.2f} (se {se:.2f}), p = {p:.4f}')
+y_clean = y[mask]
+X_clean = X[mask]
 
-    # plot fitted vs actual
-    DF['fitted'] = model.fittedvalues
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name='Actual'))
-    fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
+# Fit model on cleaned data
+model = ols_with_controls(y_clean, X_clean)
+st.subheader('Model summary (HAC SE)')
+st.text(model.summary())
+
+# coefficient for campaign (if present)
+if 'campaign' in model.params.index:
+    coef = model.params['campaign']
+    se = model.bse['campaign']
+    p = model.pvalues['campaign']
+    st.write(f'Campaign coefficient = {coef:.2f} (se {se:.2f}), p = {p:.4f}')
+
+# plot fitted vs actual — place fitted values back into full DF for plotting
+DF['fitted'] = np.nan
+DF.loc[mask, 'fitted'] = model.fittedvalues
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name='Actual'))
+fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
+if 'start_idx' in locals() and start_idx is not None:
+    try:
+        fig2.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.08, layer='below', line_width=0)
+    except Exception:
+        pass
+st.plotly_chart(fig2, use_container_width=True)
     if start_idx is not None:
         fig2.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.08, layer='below', line_width=0)
     st.plotly_chart(fig2, use_container_width=True)
@@ -516,7 +542,7 @@ with tabs[9]:
     else:
         st.info('No campaign detected to split weekly pre/post.')
 
-st.sidebar.header('Export')
+st.sidebar.header('Export'
 if st.sidebar.button('Download model summary as CSV'):
     buf = BytesIO()
     try:

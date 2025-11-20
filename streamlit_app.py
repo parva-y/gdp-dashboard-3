@@ -131,13 +131,62 @@ elif use_defaults:
         st.sidebar.error('Could not load default spends file. Please upload one.')
         st.stop()
 
-# parse dates
+# parse dates and robust cleaning (handles non-numeric strings, commas, symbols)
+
+# helper to coerce numeric-like strings to numbers
+def safe_to_numeric(s):
+    return pd.to_numeric(s.astype(str).str.replace(r'[,\s%₹]', '', regex=True).str.strip(), errors='coerce')
+
+# Ensure Date columns are parsed first (try dayfirst)
 searches = parse_dates(searches, date_col='Date')
 spends = parse_dates(spends, date_col='Date')
 
-# unify on dates
+# Identify non-date columns in searches and coerce to numeric where appropriate
+non_date_cols = [c for c in searches.columns if c != 'Date']
+for col in non_date_cols:
+    # coerce and replace in-place, but keep original if needed for debugging
+    before_nonnull = searches[col].notna().sum()
+    searches[col] = safe_to_numeric(searches[col])
+    after_nonnull = searches[col].notna().sum()
+    if after_nonnull < before_nonnull:
+        st.warning(f"Column {col}: {before_nonnull-after_nonnull} non-numeric entries coerced to NaN.")
+
+# Ensure spends has 'Spend' column and coerce to numeric
+if 'Spend' not in spends.columns:
+    possible = [c for c in spends.columns if 'spend' in c.lower() or 'amount' in c.lower()]
+    if len(possible) > 0:
+        spends.rename(columns={possible[0]:'Spend'}, inplace=True)
+    else:
+        st.error("Spends file doesn't contain a 'Spend' column. Rename the column to 'Spend' and re-upload.")
+        st.stop()
+
+spends['Spend'] = safe_to_numeric(spends['Spend'])
+num_spend_na = spends['Spend'].isna().sum()
+if num_spend_na > 0:
+    st.warning(f'{num_spend_na} Spend values could not be parsed to numeric and were set to NaN. Filling with 0.')
+    spends['Spend'] = spends['Spend'].fillna(0)
+
+# Merge cleaned datasets (both should have datetime Date column now)
 DF = pd.merge(searches, spends[['Date', 'Spend']], on='Date', how='left')
 DF['Spend'] = DF['Spend'].fillna(0)
+
+# Ensure remaining non-date columns are numeric; coerce if needed and stop if any remain non-numeric
+for c in DF.columns:
+    if c == 'Date':
+        continue
+    if DF[c].dtype == 'O':
+        try:
+            DF[c] = safe_to_numeric(DF[c])
+            st.info(f'Coerced {c} to numeric.')
+        except Exception:
+            st.warning(f'Could not coerce column {c}; it remains object dtype.')
+
+problem_cols = [c for c in DF.columns if c != 'Date' and not np.issubdtype(DF[c].dtype, np.number)]
+if len(problem_cols) > 0:
+    st.error('The following columns are still non-numeric and will break numeric ops: ' + ', '.join(problem_cols))
+    st.stop()
+
+st.success('Data cleaning complete — numeric types OK.')
 
 # weekly toggle
 st.sidebar.header('Settings')

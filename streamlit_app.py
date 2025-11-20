@@ -516,7 +516,7 @@ with tabs[9]:
     else:
         st.info('No campaign detected to split weekly pre/post.')
 
-st.sidebar.header('Export'
+st.sidebar.header('Export')
 if st.sidebar.button('Download model summary as CSV'):
     buf = BytesIO()
     try:

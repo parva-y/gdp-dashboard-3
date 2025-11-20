@@ -10,15 +10,22 @@ import numpy as np
 from datetime import datetime
 import io
 import statsmodels.api as sm
-from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.stats.weightstats import ttest_ind
-from statsmodels.stats.sandwich_covariance import cov_hac
 from statsmodels.tools.tools import add_constant
 from scipy import stats
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
+
+# Optional advanced methods (ridge, elastic net, PCA)
+try:
+    from sklearn.linear_model import Ridge, ElasticNet
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 st.set_page_config(page_title='HDFC Sky Lift Analyzer', layout='wide')
 
@@ -59,7 +66,7 @@ def aggregate_weekly(df, date_col='Date'):
 
 
 def detect_campaign(spend_series):
-    # campaign where spend > 0
+    # campaign where spend > 0 (continuous period)
     mask = spend_series > 0
     if mask.sum() == 0:
         return None, None
@@ -104,8 +111,19 @@ def ols_with_controls(y, X):
     X_clean = X_clean[valid_mask]
     
     Xc = add_constant(X_clean)
-    model = sm.OLS(y_clean.astype(float), Xc.astype(float)).fit(cov_type='HAC', cov_kwds={'maxlags':7})
+    model = sm.OLS(y_clean.astype(float), Xc.astype(float)).fit(
+        cov_type='HAC',
+        cov_kwds={'maxlags': 7}
+    )
     return model
+
+
+# helper to coerce numeric-like strings to numbers
+def safe_to_numeric(s):
+    return pd.to_numeric(
+        s.astype(str).str.replace(r'[,\s%₹]', '', regex=True).str.strip(),
+        errors='coerce'
+    )
 
 # ----------------------------
 # Load data
@@ -151,10 +169,6 @@ elif use_defaults:
 
 # parse dates and robust cleaning (handles non-numeric strings, commas, symbols)
 
-# helper to coerce numeric-like strings to numbers
-def safe_to_numeric(s):
-    return pd.to_numeric(s.astype(str).str.replace(r'[,\s%₹]', '', regex=True).str.strip(), errors='coerce')
-
 # Ensure Date columns are parsed first (try dayfirst)
 searches = parse_dates(searches, date_col='Date')
 spends = parse_dates(spends, date_col='Date')
@@ -162,7 +176,6 @@ spends = parse_dates(spends, date_col='Date')
 # Identify non-date columns in searches and coerce to numeric where appropriate
 non_date_cols = [c for c in searches.columns if c != 'Date']
 for col in non_date_cols:
-    # coerce and replace in-place, but keep original if needed for debugging
     before_nonnull = searches[col].notna().sum()
     searches[col] = safe_to_numeric(searches[col])
     after_nonnull = searches[col].notna().sum()
@@ -188,13 +201,13 @@ if num_spend_na > 0:
 DF = pd.merge(searches, spends[['Date', 'Spend']], on='Date', how='left')
 DF['Spend'] = DF['Spend'].fillna(0)
 
-# CRITICAL FIX: Ensure ALL non-Date columns are numeric
+# Ensure ALL non-Date columns are numeric
 for c in DF.columns:
     if c == 'Date':
         continue
     DF[c] = pd.to_numeric(DF[c], errors='coerce')
 
-# Fill any remaining NaNs with 0 (or you could drop these rows)
+# Fill any remaining NaNs with 0
 numeric_cols = [c for c in DF.columns if c != 'Date']
 DF[numeric_cols] = DF[numeric_cols].fillna(0)
 
@@ -207,7 +220,10 @@ if len(problem_cols) > 0:
 
 st.success('Data cleaning complete — all numeric columns verified.')
 
-# weekly toggle
+# ----------------------------
+# Settings
+# ----------------------------
+
 st.sidebar.header('Settings')
 weekly = st.sidebar.checkbox('Aggregate to weekly', value=False)
 if weekly:
@@ -233,20 +249,32 @@ else:
     if start_idx is None:
         st.warning('No campaign spend detected (all spends are 0). App will still show correlations and diagnostics.')
     else:
-        camp_start_date = DF.loc[start_idx, 'Date']
-        camp_end_date = DF.loc[end_idx, 'Date']
-        st.sidebar.success(f"Auto-detected campaign: {camp_start_date.date()} → {camp_end_date.date()}")
+        camp_start_date_auto = DF.loc[start_idx, 'Date']
+        camp_end_date_auto = DF.loc[end_idx, 'Date']
+        st.sidebar.success(f"Auto-detected campaign: {camp_start_date_auto.date()} → {camp_end_date_auto.date()}")
+
+# For date-based logic in PCA etc.
+if start_idx is not None:
+    camp_start_date = DF.loc[start_idx, 'Date']
+    camp_end_date = DF.loc[end_idx, 'Date']
+else:
+    camp_start_date = None
+    camp_end_date = None
 
 # columns
 st.sidebar.markdown('**Columns detected**')
 cols = [c for c in DF.columns if c not in ['Date','Spend']]
 st.sidebar.text(', '.join(cols[:10]) + (', ...' if len(cols)>10 else ''))
 
-# default outcome is HDFC Sky
+# default outcome is first column (assumed HDFC Sky)
 outcome = st.sidebar.selectbox('Primary outcome (search column)', options=cols, index=0)
 
 # indicators and competitors — by default all others
-controls = st.sidebar.multiselect('Controls (competitors + market indicators)', options=[c for c in cols if c!=outcome], default=[c for c in cols if c!=outcome])
+controls = st.sidebar.multiselect(
+    'Controls (competitors + market indicators)',
+    options=[c for c in cols if c!=outcome],
+    default=[c for c in cols if c!=outcome]
+)
 
 alpha = st.sidebar.number_input(
     'Significance alpha',
@@ -255,6 +283,38 @@ alpha = st.sidebar.number_input(
     value=0.05,
     step=0.01
 )
+
+# ----------------------------
+# Base ITS design & model (used by several tabs)
+# ----------------------------
+
+X_base = pd.DataFrame()
+X_base['time_idx'] = np.arange(len(DF))
+if start_idx is not None:
+    X_base['campaign'] = 0
+    X_base.loc[start_idx:end_idx, 'campaign'] = 1
+else:
+    X_base['campaign'] = 0
+
+# add day-of-week
+try:
+    X_base['dow'] = DF['Date'].dt.dayofweek
+    X_base = pd.get_dummies(X_base, columns=['dow'], drop_first=True)
+except Exception:
+    pass
+
+# add controls
+for c in controls:
+    X_base[c] = DF[c].values
+
+y = DF[outcome]
+
+model = ols_with_controls(y, X_base)
+
+# fitted for plotting
+fitted_full = pd.Series(index=DF.index, dtype=float)
+fitted_full.loc[model.fittedvalues.index] = model.fittedvalues.values
+DF['fitted'] = fitted_full
 
 # ----------------------------
 # Tabs
@@ -267,6 +327,10 @@ tabs = st.tabs([
     'DiD & Controls',
     'Correlations',
     'Lift Summary',
+    'Ridge / Elastic Net',
+    'Lagged ITS',
+    'PCA Controls',
+    'Weekly DiD',
     'Interpretation'
 ])
 
@@ -326,28 +390,6 @@ with tabs[1]:
 # ITS / Regression
 with tabs[2]:
     st.header('Interrupted Time Series / OLS with controls')
-    # Prepare design
-    X = pd.DataFrame()
-    X['time_idx'] = np.arange(len(DF))
-    if start_idx is not None:
-        X['campaign'] = 0
-        X.loc[start_idx:end_idx,'campaign'] = 1
-    else:
-        X['campaign'] = 0
-    # add day-of-week
-    try:
-        X['dow'] = DF['Date'].dt.dayofweek
-        X = pd.get_dummies(X, columns=['dow'], drop_first=True)
-    except Exception:
-        pass
-
-    # add controls
-    for c in controls:
-        X[c] = DF[c].values
-
-    y = DF[outcome]  # Keep as Series, not .values
-
-    model = ols_with_controls(y, X)
     st.subheader('Model summary (HAC SE)')
     st.text(model.summary())
 
@@ -358,11 +400,6 @@ with tabs[2]:
         p = model.pvalues['campaign']
         st.write(f'Campaign coefficient = {coef:.2f} (se {se:.2f}), p = {p:.4f}')
 
-    # plot fitted vs actual
-    fitted_full = pd.Series(index=DF.index, dtype=float)
-    fitted_full.loc[model.fittedvalues.index] = model.fittedvalues.values
-    DF['fitted'] = fitted_full
-    
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name='Actual'))
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
@@ -467,7 +504,7 @@ with tabs[5]:
         abs_df = pd.DataFrame(abs_rows).dropna()
         rel_df = pd.DataFrame(rel_rows).dropna()
 
-        st.subheader('Absolute lift (incremental searches per day)')
+        st.subheader('Absolute lift (incremental searches per period)')
         if not abs_df.empty:
             fig_abs = px.bar(abs_df, x='Metric', y='Lift', text='Lift')
             fig_abs.update_traces(texttemplate='%{text:.1f}', textposition='outside')
@@ -497,312 +534,433 @@ with tabs[5]:
 
         st.markdown("""
         **Definitions:**
-        - **Absolute (Δ mean)**: Difference in average searches per day (campaign − pre).
+        - **Absolute (Δ mean)**: Difference in average searches per day/period (campaign − pre).
         - **Relative (%)**: Percentage change in average searches: (campaign / pre − 1) × 100.
         - **DiD (Δ vs controls)**: (Δ outcome) − (Δ synthetic control), using mean of selected controls.
         - **ITS (campaign coef)**: Incremental level shift estimated by the ITS regression with controls.
         """)
 
-# Interpretation
+# Ridge / Elastic Net
 with tabs[6]:
+    st.header('Ridge / Elastic Net (regularised regression)')
+    if not SKLEARN_AVAILABLE:
+        st.error('scikit-learn is not installed in this environment. Install it to use Ridge/Elastic Net.')
+    else:
+        st.markdown("Regularised regression to stabilise coefficients with many correlated controls.")
+
+        feature_cols = list(X_base.columns)  # time_idx, campaign, dummies, controls
+        X_reg = X_base[feature_cols].copy()
+        y_reg = y.loc[X_reg.index]
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_reg)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            model_type = st.radio('Model type', ['Ridge', 'Elastic Net'], horizontal=True)
+        with col2:
+            alpha_reg = st.slider('Alpha (penalty λ)', 0.0, 10.0, 1.0, 0.1)
+
+        if model_type == 'Ridge':
+            reg = Ridge(alpha=alpha_reg)
+        else:
+            l1_ratio = st.slider('Elastic Net l1_ratio', 0.0, 1.0, 0.5, 0.05)
+            reg = ElasticNet(alpha=alpha_reg, l1_ratio=l1_ratio)
+
+        reg.fit(X_scaled, y_reg)
+        coef_series = pd.Series(reg.coef_, index=feature_cols)
+
+        st.subheader('Regularised coefficients')
+        st.dataframe(coef_series.to_frame('coef'))
+
+        if 'campaign' in coef_series.index:
+            st.markdown(f"**Campaign coefficient ({model_type}) ≈ {coef_series['campaign']:.2f} (on standardised predictors)**")
+
+        top_coef = coef_series.reindex(coef_series.abs().sort_values(ascending=False).index)
+        max_plot_n = min(20, len(top_coef))
+        n_plot = st.slider('Number of coefficients to plot', 3, max_plot_n, min(10, max_plot_n))
+
+        top_df = top_coef.head(n_plot).reset_index()
+        top_df.columns = ['feature', 'coef']
+
+        fig_r = px.bar(top_df, x='feature', y='coef', text='coef')
+        fig_r.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+        fig_r.update_layout(
+            xaxis_title='Feature',
+            yaxis_title='Coefficient',
+            uniformtext_minsize=8,
+            uniformtext_mode='hide'
+        )
+        st.plotly_chart(fig_r, use_container_width=True)
+
+# Lagged ITS
+with tabs[7]:
+    st.header('Lagged ITS (spend lags)')
+    st.markdown("Explore delayed impact of **Spend** on HDFC Sky searches using lagged spend terms.")
+
+    max_lag = st.slider('Max lag (periods)', 1, 14, 7)
+
+    # Build lagged design
+    X_lag = pd.DataFrame(index=DF.index)
+    X_lag['time_idx'] = np.arange(len(DF))
+
+    # simple campaign indicator
+    if start_idx is not None:
+        camp_dummy = pd.Series(0, index=DF.index)
+        camp_dummy.loc[start_idx:end_idx] = 1
+        X_lag['campaign'] = camp_dummy
+    else:
+        X_lag['campaign'] = 0
+
+    # current spend + lags
+    X_lag['Spend'] = DF['Spend']
+    for lag in range(1, max_lag+1):
+        X_lag[f'Spend_lag{lag}'] = DF['Spend'].shift(lag)
+
+    # controls as before
+    for c in controls:
+        X_lag[c] = DF[c]
+
+    y_lag = DF[outcome]
+
+    valid_mask = X_lag.notna().all(axis=1) & y_lag.notna()
+    X_lag_clean = X_lag[valid_mask]
+    y_lag_clean = y_lag[valid_mask]
+
+    if len(X_lag_clean) < 10:
+        st.info('Not enough data after applying lags to run lagged ITS.')
+    else:
+        model_lag = ols_with_controls(y_lag_clean, X_lag_clean)
+        st.subheader('Lagged ITS model summary')
+        st.text(model_lag.summary())
+
+        # Extract spend lag coefficients
+        lag_names = [f'Spend_lag{lag}' for lag in range(1, max_lag+1)]
+        lag_coefs = []
+        for lag_name in lag_names:
+            if lag_name in model_lag.params.index:
+                lag_coefs.append({
+                    'lag': int(lag_name.replace('Spend_lag','')),
+                    'coef': model_lag.params[lag_name]
+                })
+        if len(lag_coefs) > 0:
+            lag_df = pd.DataFrame(lag_coefs).sort_values('lag')
+            st.subheader('Spend lag coefficients')
+            st.dataframe(lag_df)
+
+            fig_lag = px.bar(lag_df, x='lag', y='coef', text='coef')
+            fig_lag.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+            fig_lag.update_layout(
+                xaxis_title='Lag (periods)',
+                yaxis_title='Coefficient',
+                uniformtext_minsize=8,
+                uniformtext_mode='hide'
+            )
+            st.plotly_chart(fig_lag, use_container_width=True)
+        else:
+            st.info('No lag coefficients were estimated (possibly dropped in regression).')
+
+# PCA Controls
+with tabs[8]:
+    st.header('PCA Controls (competitor compression)')
+    if not SKLEARN_AVAILABLE:
+        st.error('scikit-learn is not installed in this environment. Install it to use PCA.')
+    elif len(controls) < 2:
+        st.info('Select at least two control columns to run PCA.')
+    else:
+        st.markdown("Use PCA to compress many correlated competitors/indicators into a few orthogonal market factors.")
+
+        C = DF[controls].copy()
+        valid_mask = C.notna().all(axis=1)
+        C_clean = C[valid_mask]
+
+        if C_clean.shape[0] < 10:
+            st.info('Not enough valid rows to run PCA on controls.')
+        else:
+            scaler_c = StandardScaler()
+            C_scaled = scaler_c.fit_transform(C_clean)
+
+            max_components = min(5, C_scaled.shape[1])
+            n_components = st.slider(
+                'Number of PCA components',
+                1,
+                max_components,
+                min(3, max_components)
+            )
+
+            pca = PCA(n_components=n_components)
+            pcs = pca.fit_transform(C_scaled)
+            pc_cols = [f'PC{i+1}' for i in range(n_components)]
+
+            # build regression design
+            X_pca = pd.DataFrame(index=C_clean.index)
+            X_pca['time_idx'] = np.arange(len(C_clean))
+
+            if camp_start_date is not None and camp_end_date is not None:
+                dates_sub = DF.loc[C_clean.index, 'Date']
+                X_pca['campaign'] = ((dates_sub >= camp_start_date) & (dates_sub <= camp_end_date)).astype(int)
+            else:
+                X_pca['campaign'] = 0
+
+            for i, col_name in enumerate(pc_cols):
+                X_pca[col_name] = pcs[:, i]
+
+            y_pca = DF.loc[C_clean.index, outcome]
+
+            model_pca = ols_with_controls(y_pca, X_pca)
+
+            st.subheader('ITS with PCA factors')
+            st.text(model_pca.summary())
+
+            if 'campaign' in model_pca.params.index:
+                coef_pca = model_pca.params['campaign']
+                se_pca = model_pca.bse['campaign']
+                p_pca = model_pca.pvalues['campaign']
+                st.markdown(f"**Campaign coefficient (PCA ITS)** = {coef_pca:.2f} (se {se_pca:.2f}), p = {p_pca:.4f}")
+
+            st.subheader('Explained variance by PCA components')
+            ev_df = pd.DataFrame({
+                'PC': pc_cols,
+                'explained_variance_ratio': pca.explained_variance_ratio_
+            })
+            st.dataframe(ev_df)
+
+            fig_ev = px.bar(ev_df, x='PC', y='explained_variance_ratio', text='explained_variance_ratio')
+            fig_ev.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+            fig_ev.update_layout(
+                yaxis_title='Explained variance ratio',
+                xaxis_title='Component',
+                uniformtext_minsize=8,
+                uniformtext_mode='hide'
+            )
+            st.plotly_chart(fig_ev, use_container_width=True)
+
+            st.subheader('PCA loadings (which competitors drive each PC)')
+            loadings = pd.DataFrame(
+                pca.components_.T,
+                index=controls,
+                columns=pc_cols
+            )
+            st.dataframe(loadings)
+
+# Weekly DiD
+with tabs[9]:
+    st.header('Weekly DiD view (Sky vs synthetic control)')
+    st.markdown("""
+    Aggregates to weekly and compares **HDFC Sky** vs a **synthetic control** (mean of selected controls),
+    highlighting the campaign weeks.
+    """)
+
+    if len(controls) == 0:
+        st.info('Select at least one control in the sidebar to build a synthetic control.')
+    else:
+        # If already weekly, use DF; else aggregate to weekly
+        if weekly:
+            DF_w = DF.copy()
+        else:
+            DF_w = aggregate_weekly(DF, date_col='Date')
+
+        start_w, end_w = detect_campaign(DF_w['Spend'])
+        if start_w is None:
+            st.info('No non-zero weekly spend detected to define a campaign period.')
+        else:
+            DF_w['controls_mean'] = DF_w[controls].mean(axis=1)
+
+            pre_out_w = DF_w.loc[:start_w-1, outcome].mean()
+            camp_out_w = DF_w.loc[start_w:end_w, outcome].mean()
+            pre_ctrl_w = DF_w.loc[:start_w-1, 'controls_mean'].mean()
+            camp_ctrl_w = DF_w.loc[start_w:end_w, 'controls_mean'].mean()
+
+            did_abs_w = (camp_out_w - pre_out_w) - (camp_ctrl_w - pre_ctrl_w)
+
+            st.subheader('Weekly DiD summary')
+            st.write(pd.DataFrame({
+                'metric': ['pre_outcome','camp_outcome','pre_ctrl','camp_ctrl','DiD_abs'],
+                'value': [pre_out_w, camp_out_w, pre_ctrl_w, camp_ctrl_w, did_abs_w]
+            }))
+
+            # Time series of outcome vs control
+            fig_w = go.Figure()
+            fig_w.add_trace(go.Scatter(x=DF_w['Date'], y=DF_w[outcome], name='HDFC Sky'))
+            fig_w.add_trace(go.Scatter(x=DF_w['Date'], y=DF_w['controls_mean'], name='Synthetic control'))
+            fig_w.add_vrect(
+                x0=DF_w.loc[start_w,'Date'],
+                x1=DF_w.loc[end_w,'Date'],
+                fillcolor='green',
+                opacity=0.1,
+                layer='below',
+                line_width=0
+            )
+            fig_w.update_layout(
+                yaxis_title='Weekly searches (or aggregated metric)',
+                legend=dict(orientation='h')
+            )
+            st.subheader('Weekly outcome vs synthetic control')
+            st.plotly_chart(fig_w, use_container_width=True)
+
+            # Weekly difference bar chart
+            DF_w['diff'] = DF_w[outcome] - DF_w['controls_mean']
+            fig_diff = go.Figure()
+            fig_diff.add_trace(go.Bar(x=DF_w['Date'], y=DF_w['diff'], name='HDFC Sky − control'))
+            fig_diff.add_vrect(
+                x0=DF_w.loc[start_w,'Date'],
+                x1=DF_w.loc[end_w,'Date'],
+                fillcolor='green',
+                opacity=0.1,
+                layer='below',
+                line_width=0
+            )
+            fig_diff.update_layout(
+                yaxis_title='Difference (Sky − control)',
+                legend=dict(orientation='h')
+            )
+            st.subheader('Weekly difference (Sky − synthetic control)')
+            st.plotly_chart(fig_diff, use_container_width=True)
+
+# Interpretation
+with tabs[10]:
     st.header('Interpretation & Notes')
     st.markdown(r"""
 ## 1. TL;DR – What is this model saying?
 
 - **Simple pre vs campaign**:  
-  - Mean daily searches went from **≈ 722 (pre)** to **≈ 817 (campaign)**.  
-  - That’s an **absolute change of ≈ +95 searches/day** and a **relative change of ≈ +13%**.
-  - However, the **t-test p ≈ 0.27** and the **bootstrap 95% CI [−72, +252]** both include 0 →  
-    **we cannot statistically rule out “no lift”** on a pure pre/post basis.
+  - Mean daily searches went from **pre** to **campaign** at a noticeable lift.
+  - But the **t-test** and **bootstrap CI** tell you whether that lift is statistically robust or could be noise.
 
 - **ITS with controls** (time trend, day-of-week, competitors, market factors):
-  - The **campaign coefficient is −24** (se ≈ 64, p ≈ 0.71) → **no evidence of incremental lift**  
-    once you control for time, competitors, and market indicators.
-  - The model fits the series fairly well overall (**R² ≈ 0.78**), but the **incremental “on top of everything else” effect of the campaign is not statistically different from zero**.
+  - The **campaign coefficient** captures incremental lift **after** adjusting for trends and controls.
+  - If this coefficient is small and/or not significant, the raw uplift is likely explained by **market/competitor moves and time trend**.
 
 - **DiD / synthetic control intuition**:
-  - HDFC Sky grows from ~722 to ~817 (**~+13.1%**).
-  - The synthetic control (mean of competitors/market indicators) grows from ~49.6k to ~55.9k (**~+12.8%**).
-  - **Sky is broadly moving in line with the market/competition, not clearly outperforming it**.
+  - Compare HDFC Sky vs a **synthetic control** (average of competitors/market indicators).
+  - If both grow similarly pre→campaign, then **Sky is riding the same tide** as the rest of the market.
 
-Overall: **Search volumes are higher during the campaign, but once you account for trends and a very strong market/competitor uplift, the model does *not* see a clean, statistically significant incremental lift attributable purely to the HDFC Sky branding spends.**
+Overall: Use **Pre vs Campaign** for raw lift, and **ITS / DiD / advanced views** to decide how much of that lift is truly **incremental** to the HDFC Sky branding spends.
 
 ---
 
-## 2. How to read each tab in this app
+## 2. How to read the main tabs
 
 ### (a) Pre vs Campaign – Simple lift view
 
-This is the most intuitive, “raw” view:
-
-- Compares **average daily searches pre vs during the campaign**.
-- Reports:
-  - **Descriptive stats** (n, mean, std),
-  - **T-test** for mean difference,
-  - **Bootstrap confidence interval** for the mean difference.
-
-For your current runs:
-
-- **Absolute lift (campaign − pre)** ≈ **+94.6 searches/day**.
-- **Relative lift** ≈ **+13%**.
-- But:
-  - **p ≈ 0.27** (not significant at typical α = 0.05),
-  - **Bootstrap 95% CI includes 0**, so the “true” lift could plausibly be small, zero, or even slightly negative.
+- Compares **average searches pre vs during campaign**.
+- Shows:
+  - Descriptive stats,
+  - T-test,
+  - Bootstrap CI.
 
 Use this tab as:
 
-- A **quick gut-check**: did searches move up during the campaign window at all?
-- A **storytelling entry point** for non-technical stakeholders: “raw pre vs campaign change is +13%, but we still need to adjust for trend and market factors.”
+- A **quick gut-check** on whether searches moved up at all.
+- A **storytelling anchor** (“we see ~X% higher searches in the campaign period”).
 
----
+### (b) ITS / Regression – Causal-ish with controls
 
-### (b) ITS / Regression – Causal-ish, with controls
+- Includes:
+  - `time_idx` (trend),
+  - `campaign` dummy,
+  - Day-of-week,
+  - Selected competitors & market indicators.
+- Uses **HAC robust SE** to handle autocorrelation/heteroskedasticity.
 
-Here we do an **Interrupted Time Series (ITS)** style OLS regression with:
+Read:
 
-- **time_idx**: linear time trend,
-- **campaign dummy**: 0 pre, 1 during campaign,
-- **day-of-week dummies**,
-- **competitors & market indicators** (Zerodha, Sensex, etc.) as controls,
-- **HAC robust standard errors** to handle autocorrelation/heteroskedasticity.
+- **Campaign coefficient** → incremental level shift after accounting for all included controls.
+- Check:
+  - Sign (positive/negative),
+  - Magnitude,
+  - p-value vs your chosen alpha.
 
-Key numbers from your run:
-
-- **R² ≈ 0.776** (model explains a good chunk of variation).
-- **Campaign coef ≈ −23.97**, se ≈ 64.34, **p ≈ 0.71**:
-  - After conditioning on trend, day-of-week and competitors/market variables,
-  - There is **no statistically significant level shift** attributed to the campaign.
-- Some controls show meaningful relationships:
-  - **Zerodha** has a positive and significant coefficient → when Zerodha searches go up, HDFC Sky searches tend to go up.
-  - **Sensex** is also positive and significant → index sentiment/market conditions matter.
-
-How to read this for attribution:
-
-- The pre/post lift we see in raw averages is **largely explained by general trends and market/competitor movements**.
-- **Incremental lift on top of those forces is not detectable** in this specification.
-- This is a **more conservative, “causal-ish” view** than the simple pre vs campaign tab.
-
----
+This is the main **“did we create lift or just ride the market?”** view.
 
 ### (c) DiD & Controls – Synthetic control intuition
 
-This tab:
+- Constructs a **simple synthetic control** = mean of selected controls.
+- Compares pre vs campaign means for:
+  - HDFC Sky,
+  - `controls_mean`.
 
-1. Builds a **simple synthetic control**:  
-   \- `controls_mean = mean(selected competitors & market indicators)`.
+If Sky’s growth ≈ control’s growth:
 
-2. Looks at **pre vs campaign mean** for:
-   - HDFC Sky outcome,
-   - `controls_mean`.
-
-From your current outputs:
-
-- **HDFC Sky**:
-  - Pre: ≈ 721.7  
-  - Campaign: ≈ 816.5  
-  - Growth: **≈ +13.1%**
-
-- **Synthetic control (controls_mean)**:
-  - Pre: ≈ 49,585  
-  - Campaign: ≈ 55,945  
-  - Growth: **≈ +12.8%**
-
-Interpretation:
-
-- The **market/competitor environment itself is lifting strongly** (~13%).
-- HDFC Sky’s relative growth is **very similar** to that background movement.
-- In Difference-in-Differences terms, **there is little clear “excess lift” vs synthetic control**.
-
-The “Regression using competitor controls only” below that simply quantifies:
-
-- How much HDFC Sky searches **co-move** with the competitors’ synthetic index.
-- With **R² ≈ 0.68** and a highly significant `controls_mean` coefficient, **competitors plus market factors explain a large share of HDFC Sky variation**.
+- The campaign is likely **moving with the market** rather than driving extra lift.
 
 ---
 
-### (d) Correlations – Are we just seeing a market story?
+## 3. Advanced views
 
-This tab gives you:
+### (a) Lift Summary
 
-- A **correlation matrix** between:
-  - HDFC Sky (outcome),
-  - Selected competitors,
-  - Market indicators.
+Combines:
 
-Use it to:
+- **Absolute lift (Δ mean)**,
+- **Relative lift (%)**,
+- **DiD-based lift**,
+- **ITS-based lift (campaign coefficient)**
 
-- Identify **which competitors/indicators move closely with HDFC Sky**.
-- Spot **clusters** (e.g. brokerage terms moving together, macro indices moving together).
-- Decide which controls are **essential** vs **redundant**.
+into two bar charts (absolute and %). This is your **single screenshot** for leadership.
 
-If many competitors are highly correlated with each other, that supports the need for **regularisation (ridge/elastic net)** or **dimensionality reduction (PCA)** – see below.
+### (b) Ridge / Elastic Net
 
----
+- Addresses **multicollinearity** and many overlapping controls.
+- Shrinks noisy coefficients (Ridge) or shrinks + sparsifies (Elastic Net).
+- Look at:
+  - **Campaign coefficient under regularisation**,
+  - Which controls retain strong influence after shrinkage.
 
-### (e) Lift Summary – tying the story together
+If campaign stays small even after regularisation → **weak attribution case**.
 
-The Lift Summary tab compresses multiple perspectives into **two bar charts**:
+### (c) Lagged ITS (spend lags)
 
-1. **Absolute lift (incremental searches/day)**:
-   - **Absolute (Δ mean)** – raw pre vs campaign difference (~+95/day).
-   - **DiD (Δ vs controls)** – how much of that remains after netting out movement in the synthetic control.
-   - **ITS (campaign coef)** – incremental shift estimated by the ITS regression.
+- Adds **lagged spend variables** (`Spend_lag1`, `Spend_lag2`, …).
+- Lets you see whether **spend today drives searches with a delay**.
+- Positive, significant coefficients at lag k → **evidence of a k-period delayed effect**.
 
-2. **Relative lift (% vs pre)**:
-   - **Relative (%)** – raw percentage change (~+13%).
-   - **DiD (% vs pre)** – relative lift vs synthetic control.
-   - **ITS (% vs pre)** – ITS campaign coefficient as % of pre-campaign mean.
+### (d) PCA Controls
 
-Expected pattern given your numbers:
+- Compresses the whole competitor/indicator block into a few **PCA factors (PC1, PC2, …)**.
+- Reduces dimensionality and multicollinearity.
+- Run ITS on:
+  - `time_idx`,
+  - `campaign`,
+  - PCs instead of raw controls.
 
-- Simple pre/post bars will show a **positive absolute and % lift**.
-- DiD/ITS bars may cluster closer to **zero (and possibly slightly negative)**, reflecting the fact that:
-  - The **market/competitor environment also lifted strongly**, and
-  - Once that is soaked up, **Sky’s incremental lift is not statistically compelling**.
+Check:
 
-This is your **“single screenshot explanation chart”** for leadership:
-> “We see uplift in raw numbers, but relative to market & after controlling for trends, the incremental lift from this specific branding burst is not statistically solid.”
+- How much variance each PC explains,
+- PCA loadings (which competitors drive each factor),
+- Campaign coefficient in the **PCA ITS** model.
 
----
+### (e) Weekly DiD
 
-## 3. Advanced / future extensions (not all implemented yet)
+- Aggregates to **weekly**.
+- Plots:
+  - Weekly **HDFC Sky**,
+  - Weekly **synthetic control**,
+  - A **difference bar chart (Sky − control)**, with campaign weeks highlighted.
 
-The following concepts are **natural next steps** and can be wired into new tabs:
-
-### (a) Synthetic control regression
-
-- Instead of a simple mean of competitors, we can build a **weighted synthetic control**:
-  - Choose weights on competitor/indicator series to **best match pre-campaign HDFC Sky**.
-  - Then compare **post-campaign divergence** between HDFC Sky and this optimized synthetic series.
-- Interpretation:
-  - If Sky diverges **upward** from the synthetic control post-launch → evidence of lift.
-  - If Sky tracks the synthetic control closely → campaign likely just rode the overall market.
-
-Inside the app, this would look like:
-
-- A **“Synthetic Control” tab** with:
-  - Pre-period fit chart (Sky vs synthetic),
-  - Post-period divergence plot,
-  - Simple summary metrics (average incremental lift, % lift vs synthetic).
-
----
-
-### (b) Ridge / Elastic Net regression tabs
-
-Problem today: many controls are **highly correlated** (Zerodha, Trading, Stocks, etc.), which can cause:
-
-- High **multicollinearity**,
-- Unstable individual coefficients,
-- Inflated standard errors.
-
-Solution:
-
-- Add **Ridge** or **Elastic Net** regression tabs:
-  - Same outcome (HDFC Sky),
-  - Same predictors (time, dow, campaign, competitors, markets),
-  - But with **L2 (ridge)** or **L1+L2 (elastic net)** penalties.
-
-Benefits:
-
-- **Shrinks** noisy coefficients,
-- **Stabilises** the influence estimates for each control,
-- Helps you see whether **campaign still adds incremental explanatory power** once the model is regularised.
-
-Interpretation tab would then describe:
-
-> “When we penalise and shrink noisy competitor features, the campaign coefficient remains small/insignificant (or becomes stronger), which strengthens/weakens the attribution case accordingly.”
-
----
-
-### (c) Lagged ITS – allowing delayed effects
-
-Right now, the campaign dummy is an **instant level shift**. In reality, branding effects may be:
-
-- **Delayed** (e.g. awareness → consideration → searches),
-- **Spread** over several days/weeks.
-
-Lagged ITS extension:
-
-- Add **lagged versions** of the campaign dummy and/or spend:
-  - `campaign_lag1`, `campaign_lag7` or moving-average terms,
-  - Or lagged ad spends by 1–7 days.
-- Re-estimate ITS with these lagged variables.
-
-Interpretation:
-
-- Significant positive coefficients on **lagged campaign/spend** terms would support:
-  - “Branding effect manifests with a ~X-day lag,”
-  - Or “Effect accumulates over a week rather than a sharp break on launch day.”
-
----
-
-### (d) PCA competitor compression
-
-Given many overlapping competitor & keyword series, we can:
-
-- Run **Principal Component Analysis (PCA)** on the competitor/indicator block.
-- Replace dozens of collinear controls with a handful of **orthogonal “market factors”** (PC1, PC2, PC3…).
-
-Benefits:
-
-- Reduces **dimensionality**,
-- Tackles **multicollinearity** explicitly,
-- Makes the ITS & DiD models more stable.
-
-In the UI, a **“PCA Controls” tab** could show:
-
-- Variance explained by each component,
-- Loadings (which competitors contribute to each factor),
-- ITS results using only **PC1–PCk** instead of raw competitors.
-
----
-
-### (e) Weekly DiD chart – cleaner visual for management
-
-To smooth noise and provide a more presentation-friendly view:
-
-1. Aggregate to **weekly data** (checkbox already exists).
-2. Compute:
-   - Weekly **HDFC Sky search totals or averages**,
-   - Weekly **synthetic control** (competitor/market average or PCA factor),
-   - **Pre vs post weekly differences**.
-3. Plot:
-   - A **time series** of HDFC Sky vs synthetic control by week,
-   - A **bar chart** of **weekly difference (Sky − synthetic)**, highlighting the campaign weeks.
-
-Interpretation:
-
-- If weekly differences **consistently jump up** during campaign weeks vs pre-trend → visual DiD-style evidence of lift.
-- If they **oscillate around zero** or **decline**, the campaign is more likely just tracking or slightly underperforming the broader market wave.
+If weekly differences jump up and stay up during campaign weeks → **clearer visual evidence of lift**.  
+If they stay flat around zero → **Sky is just tracking the market**.
 
 ---
 
 ## 4. How to use this app in practice
 
-1. **Start with Pre vs Campaign**  
-   - Use this to **anchor the business story** (“we saw ~13% higher searches”).
+1. **Start simple** – Pre vs Campaign to establish raw lift.
+2. **Move to ITS** – Ask: “How much survives after controlling for trend & market?”
+3. **Use DiD & Weekly DiD** – Compare Sky vs synthetic control over time.
+4. **Stress-test with advanced tabs**:
+   - Ridge / Elastic Net to stabilise,
+   - Lagged ITS for timing of effects,
+   - PCA to simplify complex competitive landscapes.
 
-2. **Cross-check with ITS & Lift Summary**  
-   - Ask: *“How much of this survives after accounting for time, competition and the market?”*
-   - Use the **ITS and Lift Summary** to calibrate expectations.
+Your final narrative should go from:
 
-3. **Look at DiD / synthetic control**  
-   - See whether **Sky moved differently from the crowd**.
-   - If not, **position the campaign as “riding the tide” rather than purely creating it.**
+> “Searches went up during the campaign”
 
-4. **Use advanced views (ridge, PCA, lagged ITS, weekly DiD)**  
-   - For deeper modelling and to stress-test attribution conclusions,
-   - Especially when presenting to analytics / data science stakeholders.
+to:
 
-In short, the Interpretation layer should help you move the conversation from:
-
-> “Searches went up during the campaign, so it worked”
-
-to the more nuanced and rigorous:
-
-> “Searches went up, but **after adjusting for trend, competition, and market conditions, we do / do not see robust incremental lift clearly attributable to the campaign**.”
+> “Searches went up, but after adjusting for time, competitors, and market conditions, the **incremental lift attributable purely to the HDFC Sky branding campaign is / is not statistically strong, and here’s the evidence across multiple methods**.”
     """)
-
 
 # Export results
 st.sidebar.header('Export')

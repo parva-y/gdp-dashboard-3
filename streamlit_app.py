@@ -27,7 +27,7 @@ st.markdown("""
 This app:
 - Ingests daily search volumes, campaign daily spends, and market indicators.
 - Auto-detects campaign period (spend > 0; assumes continuous campaign).
-- Runs multiple lift analyses: pre-vs-campaign tests, ITS regression, DiD-like controls, OLS with spends + controls, cross-correlation and lag analysis.
+- Runs multiple lift analyses: pre-vs-campaign tests, ITS regression, DiD-like controls, OLS with spends + controls, correlations.
 - Weekly toggle to aggregate to weekly frequency.
 - Includes an "Interpretation" tab summarising results.
 
@@ -237,7 +237,6 @@ else:
         camp_end_date = DF.loc[end_idx, 'Date']
         st.sidebar.success(f"Auto-detected campaign: {camp_start_date.date()} → {camp_end_date.date()}")
 
-
 # columns
 st.sidebar.markdown('**Columns detected**')
 cols = [c for c in DF.columns if c not in ['Date','Spend']]
@@ -249,17 +248,27 @@ outcome = st.sidebar.selectbox('Primary outcome (search column)', options=cols, 
 # indicators and competitors — by default all others
 controls = st.sidebar.multiselect('Controls (competitors + market indicators)', options=[c for c in cols if c!=outcome], default=[c for c in cols if c!=outcome])
 
-# lags
-st.sidebar.markdown('Lag settings')
-max_lag = st.sidebar.number_input('Max lag (days) to consider', min_value=0, max_value=30, value=7)
-
-alpha = st.sidebar.number_input('Significance alpha', min_value=0.001, max_value=0.5, value=0.05, step=0.01)
+alpha = st.sidebar.number_input(
+    'Significance alpha',
+    min_value=0.001,
+    max_value=0.5,
+    value=0.05,
+    step=0.01
+)
 
 # ----------------------------
 # Tabs
 # ----------------------------
 
-tabs = st.tabs(['Overview & Plot','Pre vs Campaign','ITS / Regression','DiD & Controls','Correlations & Lags','Interpretation'])
+tabs = st.tabs([
+    'Overview & Plot',
+    'Pre vs Campaign',
+    'ITS / Regression',
+    'DiD & Controls',
+    'Correlations',
+    'Lift Summary',
+    'Interpretation'
+])
 
 # Overview
 with tabs[0]:
@@ -267,10 +276,21 @@ with tabs[0]:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name=outcome))
     fig.add_trace(go.Bar(x=DF['Date'], y=DF['Spend'], name='Spend', yaxis='y2', opacity=0.4))
-    fig.update_layout(yaxis=dict(title='Search Volume'), yaxis2=dict(title='Spend (INR)', overlaying='y', side='right'), legend=dict(orientation='h'))
+    fig.update_layout(
+        yaxis=dict(title='Search Volume'),
+        yaxis2=dict(title='Spend (INR)', overlaying='y', side='right'),
+        legend=dict(orientation='h')
+    )
     if start_idx is not None:
-        fig.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.1, layer='below', line_width=0)
-    st.plotly_chart(fig, width='stretch')
+        fig.add_vrect(
+            x0=DF.loc[start_idx,'Date'],
+            x1=DF.loc[end_idx,'Date'],
+            fillcolor='green',
+            opacity=0.1,
+            layer='below',
+            line_width=0
+        )
+    st.plotly_chart(fig, use_container_width=True)
 
 # Pre vs Campaign
 with tabs[1]:
@@ -280,7 +300,12 @@ with tabs[1]:
     else:
         pre, camp, post = summarize_period(DF, 'Date', outcome, start_idx, end_idx)
         st.subheader('Descriptive stats')
-        st.write(pd.DataFrame({'period': ['pre','campaign'], 'n': [len(pre), len(camp)], 'mean': [np.mean(pre), np.mean(camp)], 'std': [np.std(pre, ddof=1), np.std(camp, ddof=1)]}))
+        st.write(pd.DataFrame({
+            'period': ['pre','campaign'],
+            'n': [len(pre), len(camp)],
+            'mean': [np.mean(pre), np.mean(camp)],
+            'std': [np.std(pre, ddof=1), np.std(camp, ddof=1)]
+        }))
 
         # t-test
         tstat, pval, dfree = ttest_ind(camp, pre, usevar='unequal')
@@ -290,7 +315,13 @@ with tabs[1]:
         lower, upper, mean_diff = bootstrap_diff(np.array(pre), np.array(camp))
         st.write(f'Bootstrap mean diff (campaign - pre): {mean_diff:.2f}; 95% CI = [{lower:.2f}, {upper:.2f}]')
 
-        st.plotly_chart(px.box(pd.DataFrame({'pre':pre, 'campaign':camp}).melt(var_name='period', value_name='value'), x='period', y='value', points='all'), width='stretch')
+        st.plotly_chart(
+            px.box(
+                pd.DataFrame({'pre':pre, 'campaign':camp}).melt(var_name='period', value_name='value'),
+                x='period', y='value', points='all'
+            ),
+            use_container_width=True
+        )
 
 # ITS / Regression
 with tabs[2]:
@@ -336,8 +367,15 @@ with tabs[2]:
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name='Actual'))
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
     if start_idx is not None:
-        fig2.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.08, layer='below', line_width=0)
-    st.plotly_chart(fig2, width='stretch')
+        fig2.add_vrect(
+            x0=DF.loc[start_idx,'Date'],
+            x1=DF.loc[end_idx,'Date'],
+            fillcolor='green',
+            opacity=0.08,
+            layer='below',
+            line_width=0
+        )
+    st.plotly_chart(fig2, use_container_width=True)
 
 # DiD & Controls
 with tabs[3]:
@@ -351,7 +389,10 @@ with tabs[3]:
             pre_mean_ctrl = DF.loc[:start_idx-1, 'controls_mean'].mean()
             camp_mean_ctrl = DF.loc[start_idx:end_idx, 'controls_mean'].mean()
             st.write('Raw pre vs campaign means (outcome vs controls_mean)')
-            st.write(pd.DataFrame({'metric': ['pre_outcome','camp_outcome','pre_ctrl','camp_ctrl'], 'value':[pre_mean_outcome,camp_mean_outcome,pre_mean_ctrl,camp_mean_ctrl]}))
+            st.write(pd.DataFrame({
+                'metric': ['pre_outcome','camp_outcome','pre_ctrl','camp_ctrl'],
+                'value':[pre_mean_outcome,camp_mean_outcome,pre_mean_ctrl,camp_mean_ctrl]
+            }))
 
         st.subheader('Regression using competitor controls only')
         Xc = add_constant(DF[['controls_mean']])
@@ -360,51 +401,117 @@ with tabs[3]:
     else:
         st.info('No controls selected')
 
-# Correlations & Lags
+# Correlations
 with tabs[4]:
-    st.header('Correlations, cross-correlation & lag analysis')
+    st.header('Correlations')
     st.subheader('Correlation matrix (outcome + controls)')
     corr_cols = [outcome] + controls
     if len(corr_cols) > 1:
         corr_df = DF[corr_cols].corr()
         st.dataframe(corr_df)
-        st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), width='stretch')
+        st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), use_container_width=True)
+    else:
+        st.info('Select at least one control to see correlations.')
 
-    st.subheader('Cross-correlation (lag) between Spend and Outcome)')
-    maxlag = int(max_lag)
-    s = DF['Spend'].values - np.mean(DF['Spend'].values)
-    y = DF[outcome].values - np.mean(DF[outcome].values)
-    ccs = [np.corrcoef(s[:-lag] if lag>0 else s, y[lag:] if lag>0 else y)[0,1] for lag in range(0, maxlag+1)]
-    lag_df = pd.DataFrame({'lag': list(range(0,maxlag+1)), 'corr': ccs})
-    st.line_chart(lag_df.rename(columns={'lag':'index'}).set_index('index'))
+# Lift Summary
+with tabs[5]:
+    st.header('Lift summary — absolute, relative, DiD & ITS')
 
-    # Granger causality on top competitors
-    try:
+    if start_idx is None:
+        st.info('No campaign detected — cannot compute lift statistics.')
+    else:
+        # Simple pre vs campaign split
+        pre, camp, post = summarize_period(DF, 'Date', outcome, start_idx, end_idx)
+        pre_mean = pre.mean()
+        camp_mean = camp.mean()
+
+        # Absolute and relative lift (simple pre vs campaign)
+        abs_lift_simple = camp_mean - pre_mean
+        rel_lift_simple = (camp_mean / pre_mean - 1) * 100 if pre_mean != 0 else np.nan
+
+        # Ensure synthetic control exists if controls are provided
+        did_abs = np.nan
+        did_rel = np.nan
         if len(controls) > 0:
-            st.subheader('Granger causality tests (top controls)')
-            top_controls = list(DF[controls].corrwith(DF[outcome]).abs().sort_values(ascending=False).index[:5])
-            gc_results = {}
-            from statsmodels.tsa.stattools import grangercausalitytests
-            for ctl in top_controls:
-                test_df = DF[[outcome, ctl]].dropna()
-                try:
-                    res = grangercausalitytests(test_df[[outcome, ctl]], maxlag=min(7, maxlag), verbose=False)
-                    pvals = [res[l][0]['ssr_ftest'][1] for l in res]
-                    gc_results[ctl] = pvals
-                except Exception as e:
-                    gc_results[ctl] = str(e)
-            st.write(gc_results)
-    except Exception as e:
-        st.write('Granger tests failed: ', e)
+            if 'controls_mean' not in DF.columns:
+                DF['controls_mean'] = DF[controls].mean(axis=1)
+
+            pre_ctrl = DF.loc[:start_idx-1, 'controls_mean'].mean()
+            camp_ctrl = DF.loc[start_idx:end_idx, 'controls_mean'].mean()
+
+            did_abs = (camp_mean - pre_mean) - (camp_ctrl - pre_ctrl)
+            did_rel = (did_abs / pre_mean * 100) if pre_mean != 0 else np.nan
+
+        # ITS-based lift (campaign coefficient from OLS with controls)
+        its_abs = np.nan
+        its_rel = np.nan
+        try:
+            if 'campaign' in model.params.index:
+                its_abs = model.params['campaign']
+                its_rel = (its_abs / pre_mean * 100) if pre_mean != 0 else np.nan
+        except Exception:
+            pass
+
+        # Build dataframes for plotting
+        abs_rows = [
+            {'Metric': 'Absolute (Δ mean)', 'Lift': abs_lift_simple},
+            {'Metric': 'DiD (Δ vs controls)', 'Lift': did_abs},
+            {'Metric': 'ITS (campaign coef)', 'Lift': its_abs}
+        ]
+        rel_rows = [
+            {'Metric': 'Relative (%)', 'Lift': rel_lift_simple},
+            {'Metric': 'DiD (% vs pre)', 'Lift': did_rel},
+            {'Metric': 'ITS (% vs pre)', 'Lift': its_rel}
+        ]
+
+        abs_df = pd.DataFrame(abs_rows).dropna()
+        rel_df = pd.DataFrame(rel_rows).dropna()
+
+        st.subheader('Absolute lift (incremental searches per day)')
+        if not abs_df.empty:
+            fig_abs = px.bar(abs_df, x='Metric', y='Lift', text='Lift')
+            fig_abs.update_traces(texttemplate='%{text:.1f}', textposition='outside')
+            fig_abs.update_layout(
+                yaxis_title='Incremental searches',
+                xaxis_title='',
+                uniformtext_minsize=10,
+                uniformtext_mode='hide'
+            )
+            st.plotly_chart(fig_abs, use_container_width=True)
+        else:
+            st.info('Not enough information to compute absolute lift metrics.')
+
+        st.subheader('Relative lift (% vs pre-campaign mean)')
+        if not rel_df.empty:
+            fig_rel = px.bar(rel_df, x='Metric', y='Lift', text='Lift')
+            fig_rel.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+            fig_rel.update_layout(
+                yaxis_title='Lift (%)',
+                xaxis_title='',
+                uniformtext_minsize=10,
+                uniformtext_mode='hide'
+            )
+            st.plotly_chart(fig_rel, use_container_width=True)
+        else:
+            st.info('Not enough information to compute relative lift metrics.')
+
+        st.markdown("""
+        **Definitions:**
+        - **Absolute (Δ mean)**: Difference in average searches per day (campaign − pre).
+        - **Relative (%)**: Percentage change in average searches: (campaign / pre − 1) × 100.
+        - **DiD (Δ vs controls)**: (Δ outcome) − (Δ synthetic control), using mean of selected controls.
+        - **ITS (campaign coef)**: Incremental level shift estimated by the ITS regression with controls.
+        """)
 
 # Interpretation
-with tabs[5]:
+with tabs[6]:
     st.header('Interpretation & Notes')
     st.markdown('''
     - The **Pre vs Campaign** tests give a quick check: mean changes, t-test and bootstrap CI.
     - The **ITS / Regression** tab attempts to control for time trend, day-of-week and the competitor/indicator columns you selected.
     - The **DiD** style check creates a simple synthetic control (mean of competitor columns) — not a full synthetic control method but useful as a quick check.
-    - The **Correlations & Lags** tab helps detect whether rises in HDFC Sky follow spend with a lag, or whether competitors/market indicators move together (which might indicate market-wide effects).
+    - The **Correlations** tab helps detect whether competitors/market indicators move together (which might indicate market-wide effects).
+    - The **Lift Summary** tab visualises absolute and percentage lift across simple pre/post, DiD and ITS views.
 
     **How to read results:**
     - Focus on the campaign coefficient in the ITS model: its sign, magnitude and p-value. If positive and significant (p < alpha) that suggests lift after accounting for included controls.
@@ -414,7 +521,6 @@ with tabs[5]:
     **Limitations:**
     - This app uses OLS + HAC SE for quick inference. For a full Bayesian structural-time-series causal impact analysis consider running a dedicated Bayesian package offline.
     - The synthetic control here is a simple average; for stronger attribution use proper synthetic control libraries.
-
     ''')
 
 # Export results
@@ -422,7 +528,11 @@ st.sidebar.header('Export')
 if st.sidebar.button('Download model summary as CSV'):
     buf = BytesIO()
     try:
-        summary_df = pd.DataFrame({'param': model.params.index, 'coef': model.params.values, 'pval': model.pvalues.values})
+        summary_df = pd.DataFrame({
+            'param': model.params.index,
+            'coef': model.params.values,
+            'pval': model.pvalues.values
+        })
         summary_df.to_csv(buf, index=False)
         buf.seek(0)
         st.download_button('Download CSV', data=buf, file_name='model_summary.csv', mime='text/csv')

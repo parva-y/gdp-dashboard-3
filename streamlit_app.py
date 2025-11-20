@@ -219,7 +219,10 @@ else:
     else:
         camp_start_date = DF.loc[start_idx, 'Date']
         camp_end_date = DF.loc[end_idx, 'Date']
-        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')} -> {camp_end_date.date()}')
+        st.sidebar.success(
+    f"Auto-detected campaign: {camp_start_date.date()} → {camp_end_date.date()}"
+)
+
 
 # columns
 st.sidebar.markdown('**Columns detected**')
@@ -542,7 +545,7 @@ with tabs[9]:
     else:
         st.info('No campaign detected to split weekly pre/post.')
 
-st.sidebar.header('Export'
+st.sidebar.header('Export')
 if st.sidebar.button('Download model summary as CSV'):
     buf = BytesIO()
     try:

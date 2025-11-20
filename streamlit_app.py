@@ -1,225 +1,342 @@
+# streamlit_hdfc_lift_app.py
+# Streamlit app to analyse lift from branding spends using search volumes + market indicators + competitors
+# Default file paths (will be transformed to URLs by platform):
+# - Searches Excel: /mnt/data/Searches Last 90 Days.xlsx
+# - Spends CSV: /mnt/data/Spends.csv
+
 import streamlit as st
 import pandas as pd
+import numpy as np
+from datetime import datetime
+import io
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.stats.weightstats import ttest_ind
+from statsmodels.stats.sandwich_covariance import cov_hac
+from statsmodels.tools.tools import add_constant
+from scipy import stats
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from io import BytesIO
 
-st.set_page_config(page_title="Data Analysis Dashboard", layout="wide")
+st.set_page_config(page_title='HDFC Sky Lift Analyzer', layout='wide')
 
-st.title("📊 Data Filter & Visualization Dashboard")
+st.title('HDFC Sky — Branding Lift & Attribution Analyzer')
+st.markdown("""
+This app:
+- Ingests daily search volumes, campaign daily spends, and market indicators.
+- Auto-detects campaign period (spend > 0; assumes continuous campaign).
+- Runs multiple lift analyses: pre-vs-campaign tests, ITS regression, DiD-like controls, OLS with spends + controls, cross-correlation and lag analysis.
+- Weekly toggle to aggregate to weekly frequency.
+- Includes an "Interpretation" tab summarising results.
 
-# File uploader
-uploaded_file = st.file_uploader("Upload your CSV file", type=['csv'])
+**Defaults:** the app will attempt to load files from the provided paths if you don't upload new ones.
+""")
 
-if uploaded_file is not None:
-    # Load data
-    df = pd.read_csv(uploaded_file)
-    
-    # Try to identify date column
-    date_cols = [col for col in df.columns if 'date' in col.lower() or 'open_date' in col.lower()]
-    
-    st.sidebar.header("🔧 Configuration")
-    
-    # Select date column
-    date_column = st.sidebar.selectbox("Select Date Column", date_cols if date_cols else df.columns)
-    
-    # Convert to datetime
-    df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
-    df = df.sort_values(date_column)
-    
-    # Display raw data
-    with st.expander("📋 View Raw Data"):
-        st.dataframe(df, use_container_width=True)
-    
-    st.sidebar.subheader("📅 Date Range Filter")
-    min_date = df[date_column].min().date()
-    max_date = df[date_column].max().date()
-    
-    date_range = st.sidebar.date_input(
-        "Select Date Range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    if len(date_range) == 2:
-        mask = (df[date_column].dt.date >= date_range[0]) & (df[date_column].dt.date <= date_range[1])
-        filtered_df = df[mask].copy()
+# ----------------------------
+# Helper functions
+# ----------------------------
+
+def parse_dates(df, date_col='Date'):
+    # try dd/mm/yyyy then fallback
+    try:
+        df[date_col] = pd.to_datetime(df[date_col], dayfirst=True)
+    except Exception:
+        df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values(date_col).reset_index(drop=True)
+    return df
+
+
+def aggregate_weekly(df, date_col='Date'):
+    df = df.copy()
+    df['WeekStart'] = df[date_col] - pd.to_timedelta(df[date_col].dt.dayofweek, unit='d')
+    agg = df.groupby('WeekStart').sum().reset_index().rename(columns={'WeekStart': 'Date'})
+    return agg
+
+
+def detect_campaign(spend_series):
+    # campaign where spend > 0
+    mask = spend_series > 0
+    if mask.sum() == 0:
+        return None, None
+    first = mask.idxmax()
+    last = len(mask) - 1 - mask[::-1].idxmax()
+    return first, last
+
+
+def summarize_period(df, date_col, col, start_idx, end_idx):
+    pre = df.loc[:start_idx-1, col]
+    camp = df.loc[start_idx:end_idx, col]
+    post = df.loc[end_idx+1:, col]
+    return pre, camp, post
+
+
+def bootstrap_diff(pre, camp, n_boot=2000):
+    # bootstrap mean diff camp - pre
+    rng = np.random.default_rng(0)
+    diffs = []
+    for _ in range(n_boot):
+        s_pre = rng.choice(pre, size=len(pre), replace=True)
+        s_camp = rng.choice(camp, size=len(camp), replace=True)
+        diffs.append(np.nanmean(s_camp) - np.nanmean(s_pre))
+    diffs = np.array(diffs)
+    return np.percentile(diffs, 2.5), np.percentile(diffs, 97.5), np.mean(diffs)
+
+
+def ols_with_controls(y, X):
+    Xc = add_constant(X)
+    model = sm.OLS(y, Xc).fit(cov_type='HAC', cov_kwds={'maxlags':7})
+    return model
+
+# ----------------------------
+# Load data
+# ----------------------------
+
+st.sidebar.header('Data inputs')
+searches_file = st.sidebar.file_uploader('Upload searches file (Excel with Date + columns)', type=['xlsx','xls','csv'])
+spends_file = st.sidebar.file_uploader('Upload spends file (CSV with Date, Spend)', type=['csv','xlsx','xls'])
+
+default_search_path = '/mnt/data/Searches Last 90 Days.xlsx'
+default_spend_path = '/mnt/data/Spends.csv'
+
+use_defaults = False
+if searches_file is None and spends_file is None:
+    st.sidebar.info('No uploads detected — app will attempt to use default files from the environment.')
+    use_defaults = True
+
+if searches_file is not None:
+    if searches_file.name.lower().endswith('.csv'):
+        searches = pd.read_csv(searches_file)
     else:
-        filtered_df = df.copy()
-    
-    # Column filters
-    st.sidebar.subheader("🔍 Column Filters")
-    
-    # Get non-date, non-numeric columns for filtering
-    categorical_cols = filtered_df.select_dtypes(include=['object']).columns.tolist()
-    
-    selected_filters = {}
-    for col in categorical_cols[:5]:  # Limit to first 5 categorical columns
-        unique_vals = filtered_df[col].dropna().unique()
-        if len(unique_vals) > 0 and len(unique_vals) < 100:
-            selected_vals = st.sidebar.multiselect(
-                f"Filter by {col}",
-                options=sorted(unique_vals.astype(str)),
-                default=None
-            )
-            if selected_vals:
-                selected_filters[col] = selected_vals
-    
-    # Apply filters
-    for col, vals in selected_filters.items():
-        filtered_df = filtered_df[filtered_df[col].astype(str).isin(vals)]
-    
-    st.write(f"**Filtered Records:** {len(filtered_df):,} rows")
-    
-    # Pivot Table Section
-    st.header("📊 Pivot Table & Visualization")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Get numeric columns for values
-        numeric_cols = filtered_df.select_dtypes(include=['int64', 'float64']).columns.tolist()
-        
-        value_column = st.selectbox("Select Value Column (Y-axis)", numeric_cols)
-        
-        # Aggregation function
-        agg_func = st.selectbox("Aggregation Function", 
-                                ['sum', 'mean', 'median', 'count', 'min', 'max'])
-    
-    with col2:
-        # Group by columns (for multiple lines)
-        all_cols = [col for col in filtered_df.columns if col != date_column]
-        group_by_col = st.selectbox("Group By (for multiple lines)", 
-                                    ['None'] + categorical_cols)
-    
-    # Create pivot/aggregation
-    if group_by_col != 'None':
-        # Pivot table with grouping
-        pivot_df = filtered_df.groupby([date_column, group_by_col])[value_column].agg(agg_func).reset_index()
-        pivot_wide = pivot_df.pivot(index=date_column, columns=group_by_col, values=value_column).reset_index()
-        
-        # Display pivot table
-        with st.expander("📋 View Pivot Table"):
-            st.dataframe(pivot_wide, use_container_width=True)
-        
-        # Plot
-        fig = go.Figure()
-        
-        for col in pivot_wide.columns[1:]:  # Skip date column
-            fig.add_trace(go.Scatter(
-                x=pivot_wide[date_column],
-                y=pivot_wide[col],
-                mode='lines+markers',
-                name=str(col),
-                line=dict(width=2),
-                marker=dict(size=6)
-            ))
-        
-        fig.update_layout(
-            title=f"{value_column} by {group_by_col} over Time ({agg_func})",
-            xaxis_title=date_column,
-            yaxis_title=f"{value_column} ({agg_func})",
-            hovermode='x unified',
-            height=600,
-            legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02)
-        )
-        
-    else:
-        # Simple aggregation by date
-        agg_df = filtered_df.groupby(date_column)[value_column].agg(agg_func).reset_index()
-        
-        # Display aggregated table
-        with st.expander("📋 View Aggregated Table"):
-            st.dataframe(agg_df, use_container_width=True)
-        
-        # Plot
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=agg_df[date_column],
-            y=agg_df[value_column],
-            mode='lines+markers',
-            name=value_column,
-            line=dict(width=3, color='#1f77b4'),
-            marker=dict(size=8)
-        ))
-        
-        fig.update_layout(
-            title=f"{value_column} over Time ({agg_func})",
-            xaxis_title=date_column,
-            yaxis_title=f"{value_column} ({agg_func})",
-            hovermode='x unified',
-            height=600
-        )
-    
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Statistics
-    st.header("📈 Summary Statistics")
-    
-    if group_by_col != 'None':
-        stats_df = pivot_df.groupby(group_by_col)[value_column].agg(['count', 'sum', 'mean', 'median', 'std', 'min', 'max']).round(2)
-    else:
-        stats_df = pd.DataFrame({
-            'Metric': ['Count', 'Sum', 'Mean', 'Median', 'Std Dev', 'Min', 'Max'],
-            'Value': [
-                agg_df[value_column].count(),
-                agg_df[value_column].sum(),
-                agg_df[value_column].mean(),
-                agg_df[value_column].median(),
-                agg_df[value_column].std(),
-                agg_df[value_column].min(),
-                agg_df[value_column].max()
-            ]
-        }).round(2)
-    
-    st.dataframe(stats_df, use_container_width=True)
-    
-    # Download options
-    st.header("💾 Download Data")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if group_by_col != 'None':
-            csv = pivot_wide.to_csv(index=False)
-        else:
-            csv = agg_df.to_csv(index=False)
-        
-        st.download_button(
-            label="Download Processed Data as CSV",
-            data=csv,
-            file_name=f"processed_data_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
-    
-    with col2:
-        filtered_csv = filtered_df.to_csv(index=False)
-        st.download_button(
-            label="Download Filtered Raw Data as CSV",
-            data=filtered_csv,
-            file_name=f"filtered_data_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
+        searches = pd.read_excel(searches_file)
+elif use_defaults:
+    try:
+        searches = pd.read_excel(default_search_path)
+        st.sidebar.success(f'Loaded searches from {default_search_path}')
+    except Exception as e:
+        st.sidebar.error('Could not load default searches file. Please upload one.')
+        st.stop()
 
+if spends_file is not None:
+    if spends_file.name.lower().endswith('.csv'):
+        spends = pd.read_csv(spends_file)
+    else:
+        spends = pd.read_excel(spends_file)
+elif use_defaults:
+    try:
+        spends = pd.read_csv(default_spend_path)
+        st.sidebar.success(f'Loaded spends from {default_spend_path}')
+    except Exception as e:
+        st.sidebar.error('Could not load default spends file. Please upload one.')
+        st.stop()
+
+# parse dates
+searches = parse_dates(searches, date_col='Date')
+spends = parse_dates(spends, date_col='Date')
+
+# unify on dates
+DF = pd.merge(searches, spends[['Date', 'Spend']], on='Date', how='left')
+DF['Spend'] = DF['Spend'].fillna(0)
+
+# weekly toggle
+st.sidebar.header('Settings')
+weekly = st.sidebar.checkbox('Aggregate to weekly', value=False)
+if weekly:
+    DF = aggregate_weekly(DF, date_col='Date')
+
+# autodetect campaign
+start_idx, end_idx = detect_campaign(DF['Spend'])
+if start_idx is None:
+    st.warning('No campaign spend detected (all spends are 0). App will still show correlations and diagnostics.')
 else:
-    st.info("👆 Please upload a CSV file to begin analysis")
-    
-    # Sample data format
-    st.subheader("Expected Data Format")
-    st.markdown("""
-    Your CSV should contain:
-    - A date column (e.g., 'OPEN_DATE', 'date', 'Date')
-    - Numeric columns for values to plot
-    - Optional categorical columns for grouping/filtering
-    
-    Example:
-    ```
-    OPEN_DATE,OPENS_COUNT,Market,Campaign
-    2025-09-21,606,US,A
-    2025-09-22,416,US,A
-    ```
-    """)
+    camp_start_date = DF.loc[start_idx, 'Date']
+    camp_end_date = DF.loc[end_idx, 'Date']
+    st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')
+
+# columns
+st.sidebar.markdown('**Columns detected**')
+cols = [c for c in DF.columns if c not in ['Date','Spend']]
+st.sidebar.text(', '.join(cols[:10]) + (', ...' if len(cols)>10 else ''))
+
+# default outcome is HDFC Sky
+outcome = st.sidebar.selectbox('Primary outcome (search column)', options=cols, index=0)
+
+# indicators and competitors — by default all others
+controls = st.sidebar.multiselect('Controls (competitors + market indicators)', options=[c for c in cols if c!=outcome], default=[c for c in cols if c!=outcome])
+
+# lags
+st.sidebar.markdown('Lag settings')
+max_lag = st.sidebar.number_input('Max lag (days) to consider', min_value=0, max_value=30, value=7)
+
+alpha = st.sidebar.number_input('Significance alpha', min_value=0.001, max_value=0.5, value=0.05, step=0.01)
+
+# ----------------------------
+# Tabs
+# ----------------------------
+
+tabs = st.tabs(['Overview & Plot','Pre vs Campaign','ITS / Regression','DiD & Controls','Correlations & Lags','Interpretation'])
+
+# Overview
+with tabs[0]:
+    st.header('Time series overview')
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name=outcome))
+    fig.add_trace(go.Bar(x=DF['Date'], y=DF['Spend'], name='Spend', yaxis='y2', opacity=0.4))
+    fig.update_layout(yaxis=dict(title='Search Volume'), yaxis2=dict(title='Spend (INR)', overlaying='y', side='right'), legend=dict(orientation='h'))
+    if start_idx is not None:
+        fig.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.1, layer='below', line_width=0)
+    st.plotly_chart(fig, use_container_width=True)
+
+# Pre vs Campaign
+with tabs[1]:
+    st.header('Pre vs Campaign — simple tests')
+    if start_idx is None:
+        st.info('No campaign — skipping pre vs campaign tests')
+    else:
+        pre, camp, post = summarize_period(DF, 'Date', outcome, start_idx, end_idx)
+        st.subheader('Descriptive stats')
+        st.write(pd.DataFrame({'period': ['pre','campaign'], 'n': [len(pre), len(camp)], 'mean': [np.mean(pre), np.mean(camp)], 'std': [np.std(pre, ddof=1), np.std(camp, ddof=1)]}))
+
+        # t-test
+        tstat, pval, dfree = ttest_ind(camp, pre, usevar='unequal')
+        st.write(f'T-test (campaign vs pre): t = {tstat:.3f}, p = {pval:.4f}')
+
+        # bootstrap
+        lower, upper, mean_diff = bootstrap_diff(np.array(pre), np.array(camp))
+        st.write(f'Bootstrap mean diff (campaign - pre): {mean_diff:.2f}; 95% CI = [{lower:.2f}, {upper:.2f}]')
+
+        st.plotly_chart(px.box(pd.DataFrame({'pre':pre, 'campaign':camp}).melt(var_name='period', value_name='value'), x='period', y='value', points='all'), use_container_width=True)
+
+# ITS / Regression
+with tabs[2]:
+    st.header('Interrupted Time Series / OLS with controls')
+    # Prepare design
+    X = pd.DataFrame()
+    X['time_idx'] = np.arange(len(DF))
+    if start_idx is not None:
+        X['campaign'] = 0
+        X.loc[start_idx:end_idx,'campaign'] = 1
+    else:
+        X['campaign'] = 0
+    # add day-of-week
+    try:
+        X['dow'] = DF['Date'].dt.dayofweek
+        X = pd.get_dummies(X, columns=['dow'], drop_first=True)
+    except Exception:
+        pass
+
+    # add controls
+    for c in controls:
+        X[c] = DF[c]
+
+    y = DF[outcome]
+
+    model = ols_with_controls(y, X)
+    st.subheader('Model summary (HAC SE)')
+    st.text(model.summary())
+
+    # coefficient for campaign
+    if 'campaign' in model.params.index:
+        coef = model.params['campaign']
+        se = model.bse['campaign']
+        p = model.pvalues['campaign']
+        st.write(f'Campaign coefficient = {coef:.2f} (se {se:.2f}), p = {p:.4f}')
+
+    # plot fitted vs actual
+    DF['fitted'] = model.fittedvalues
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=DF['Date'], y=DF[outcome], name='Actual'))
+    fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
+    if start_idx is not None:
+        fig2.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.08, layer='below', line_width=0)
+    st.plotly_chart(fig2, use_container_width=True)
+
+# DiD & Controls
+with tabs[3]:
+    st.header('Difference-in-Differences style check & Controls')
+    # Create a synthetic control by averaging controls
+    DF['controls_mean'] = DF[controls].mean(axis=1)
+    if start_idx is not None:
+        pre_mean_outcome = DF.loc[:start_idx-1, outcome].mean()
+        camp_mean_outcome = DF.loc[start_idx:end_idx, outcome].mean()
+        pre_mean_ctrl = DF.loc[:start_idx-1, 'controls_mean'].mean()
+        camp_mean_ctrl = DF.loc[start_idx:end_idx, 'controls_mean'].mean()
+        st.write('Raw pre vs campaign means (outcome vs controls_mean)')
+        st.write(pd.DataFrame({'metric': ['pre_outcome','camp_outcome','pre_ctrl','camp_ctrl'], 'value':[pre_mean_outcome,camp_mean_outcome,pre_mean_ctrl,camp_mean_ctrl]}))
+
+    st.subheader('Regression using competitor controls only')
+    Xc = add_constant(DF[['controls_mean']])
+    mod_ctrl = sm.OLS(DF[outcome], Xc).fit()
+    st.text(mod_ctrl.summary())
+
+# Correlations & Lags
+with tabs[4]:
+    st.header('Correlations, cross-correlation & lag analysis')
+    st.subheader('Correlation matrix (outcome + controls)')
+    corr_df = DF[[outcome]+controls].corr()
+    st.dataframe(corr_df)
+    st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), use_container_width=True)
+
+    st.subheader('Cross-correlation (lag) between Spend and Outcome)')
+    maxlag = int(max_lag)
+    s = DF['Spend'].values - np.mean(DF['Spend'].values)
+    y = DF[outcome].values - np.mean(DF[outcome].values)
+    ccs = [np.corrcoef(s[:-lag] if lag>0 else s, y[lag:] if lag>0 else y)[0,1] for lag in range(0, maxlag+1)]
+    lag_df = pd.DataFrame({'lag': list(range(0,maxlag+1)), 'corr': ccs})
+    st.line_chart(lag_df.rename(columns={'lag':'index'}).set_index('index'))
+
+    # Granger causality on top competitors
+    try:
+        st.subheader('Granger causality tests (top controls)')
+        top_controls = list(DF[controls].corrwith(DF[outcome]).abs().sort_values(ascending=False).index[:5])
+        gc_results = {}
+        from statsmodels.tsa.stattools import grangercausalitytests
+        for ctl in top_controls:
+            test_df = DF[[outcome, ctl]].dropna()
+            try:
+                res = grangercausalitytests(test_df[[outcome, ctl]], maxlag=min(7, maxlag), verbose=False)
+                pvals = [res[l][0]['ssr_ftest'][1] for l in res]
+                gc_results[ctl] = pvals
+            except Exception as e:
+                gc_results[ctl] = str(e)
+        st.write(gc_results)
+    except Exception as e:
+        st.write('Granger tests failed: ', e)
+
+# Interpretation
+with tabs[5]:
+    st.header('Interpretation & Notes')
+    st.markdown('''
+    - The **Pre vs Campaign** tests give a quick check: mean changes, t-test and bootstrap CI.
+    - The **ITS / Regression** tab attempts to control for time trend, day-of-week and the competitor/indicator columns you selected.
+    - The **DiD** style check creates a simple synthetic control (mean of competitor columns) — not a full synthetic control method but useful as a quick check.
+    - The **Correlations & Lags** tab helps detect whether rises in HDFC Sky follow spend with a lag, or whether competitors/market indicators move together (which might indicate market-wide effects).
+
+    **How to read results:**
+    - Focus on the campaign coefficient in the ITS model: its sign, magnitude and p-value. If positive and significant (p < alpha) that suggests lift after accounting for included controls.
+    - If competitors and market indicators move similarly and their coefficients absorb the campaign effect, that suggests your campaign may be confounded by market-wide trends.
+    - Use bootstrapped CIs for robust, distribution-free estimates of incremental mean change.
+
+    **Limitations:**
+    - This app uses OLS + HAC SE for quick inference. For a full Bayesian structural-time-series causal impact analysis consider running a dedicated Bayesian package offline.
+    - The synthetic control here is a simple average; for stronger attribution use proper synthetic control libraries.
+
+    ''')
+
+# Export results
+st.sidebar.header('Export')
+if st.sidebar.button('Download model summary as CSV'):
+    buf = BytesIO()
+    try:
+        summary_df = pd.DataFrame({'param': model.params.index, 'coef': model.params.values, 'pval': model.pvalues.values})
+        summary_df.to_csv(buf, index=False)
+        buf.seek(0)
+        st.download_button('Download CSV', data=buf, file_name='model_summary.csv', mime='text/csv')
+    except Exception as e:
+        st.error('No model to export or error: '+str(e))
+
+st.sidebar.markdown('---')
+st.sidebar.markdown('App created: uses default files from environment if not uploaded.')
+
+# End of app

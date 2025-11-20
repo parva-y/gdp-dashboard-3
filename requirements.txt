@@ -7,4 +7,3 @@ scipy
 openpyxl
 matplotlib
 xlsxwriter
-sklearn

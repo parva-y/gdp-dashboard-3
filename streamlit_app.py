@@ -194,7 +194,29 @@ weekly = st.sidebar.checkbox('Aggregate to weekly', value=False)
 if weekly:
     DF = aggregate_weekly(DF, date_col='Date')
 
-# Determine campaign period (prefer explicit 27 Sep 2025 start if present, else autodetect where Spend>0)\ntry:\n    user_campaign_start = pd.to_datetime('2025-09-27', dayfirst=True)\nexcept Exception:\n    user_campaign_start = pd.to_datetime('2025-09-27')\n\nidxs_after = DF.index[DF['Date'] >= user_campaign_start].tolist()\nif len(idxs_after) > 0:\n    start_idx = idxs_after[0]\n    spend_after = DF.loc[start_idx:, 'Spend']\n    if (spend_after > 0).any():\n        end_idx = int(spend_after[spend_after > 0].index.max())\n    else:\n        end_idx = len(DF) - 1\n    st.sidebar.success(f'Using user campaign start: {DF.loc[start_idx, "Date"].date()} -> {DF.loc[end_idx, "Date"].date()}')\nelse:\n    start_idx, end_idx = detect_campaign(DF['Spend'])\n    if start_idx is None:\n        st.warning('No campaign spend detected (all spends are 0). App will still show correlations and diagnostics.')\n    else:\n        camp_start_date = DF.loc[start_idx, 'Date']\n        camp_end_date = DF.loc[end_idx, 'Date']\n        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')} -> {camp_end_date.date()}')
+# Determine campaign period (prefer explicit 27 Sep 2025 start if present, else autodetect where Spend>0)
+try:
+    user_campaign_start = pd.to_datetime('2025-09-27', dayfirst=True)
+except Exception:
+    user_campaign_start = pd.to_datetime('2025-09-27')
+
+idxs_after = DF.index[DF['Date'] >= user_campaign_start].tolist()
+if len(idxs_after) > 0:
+    start_idx = idxs_after[0]
+    spend_after = DF.loc[start_idx:, 'Spend']
+    if (spend_after > 0).any():
+        end_idx = int(spend_after[spend_after > 0].index.max())
+    else:
+        end_idx = len(DF) - 1
+    st.sidebar.success(f'Using user campaign start: {DF.loc[start_idx, "Date"].date()} -> {DF.loc[end_idx, "Date"].date()}')
+else:
+    start_idx, end_idx = detect_campaign(DF['Spend'])
+    if start_idx is None:
+        st.warning('No campaign spend detected (all spends are 0). App will still show correlations and diagnostics.')
+    else:
+        camp_start_date = DF.loc[start_idx, 'Date']
+        camp_end_date = DF.loc[end_idx, 'Date']
+        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')} -> {camp_end_date.date()}')
 
 # columns
 st.sidebar.markdown('**Columns detected**')
@@ -216,6 +238,30 @@ alpha = st.sidebar.number_input('Significance alpha', min_value=0.001, max_value
 # ----------------------------
 # Tabs
 # ----------------------------
+
+# Determine campaign period (prefer explicit 27 Sep 2025 start if present, else autodetect where Spend>0)
+try:
+    user_campaign_start = pd.to_datetime('2025-09-27', dayfirst=True)
+except Exception:
+    user_campaign_start = pd.to_datetime('2025-09-27')
+
+idxs_after = DF.index[DF['Date'] >= user_campaign_start].tolist()
+if len(idxs_after) > 0:
+    start_idx = idxs_after[0]
+    spend_after = DF.loc[start_idx:, 'Spend']
+    if (spend_after > 0).any():
+        end_idx = int(spend_after[spend_after > 0].index.max())
+    else:
+        end_idx = len(DF) - 1
+    st.sidebar.success(f'Using user campaign start: {DF.loc[start_idx, "Date"].date()} -> {DF.loc[end_idx, "Date"].date()}')
+else:
+    start_idx, end_idx = detect_campaign(DF['Spend'])
+    if start_idx is None:
+        st.warning('No campaign spend detected (all spends are 0). App will still show correlations and diagnostics.')
+    else:
+        camp_start_date = DF.loc[start_idx, 'Date']
+        camp_end_date = DF.loc[end_idx, 'Date']
+        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')
 
 tabs = st.tabs(['Overview & Plot','Pre vs Campaign','ITS / Regression','DiD & Controls','Correlations & Lags','Interpretation'])
 

@@ -219,7 +219,9 @@ else:
     else:
         camp_start_date = DF.loc[start_idx, 'Date']
         camp_end_date = DF.loc[end_idx, 'Date']
-        st.sidebar.success(f'Auto-detected campaign: {camp_start_date.date()} -> {camp_end_date.date()}')} -> {camp_end_date.date()}')
+        st.sidebar.success(
+    f"Auto-detected campaign: {camp_start_date.date()} → {camp_end_date.date()}"
+)
 
 # columns
 st.sidebar.markdown('**Columns detected**')

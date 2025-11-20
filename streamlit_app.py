@@ -41,9 +41,12 @@ This app:
 def parse_dates(df, date_col='Date'):
     # try dd/mm/yyyy then fallback
     try:
-        df[date_col] = pd.to_datetime(df[date_col], dayfirst=True)
+        df[date_col] = pd.to_datetime(df[date_col], format='%d/%m/%Y', dayfirst=True)
     except Exception:
-        df[date_col] = pd.to_datetime(df[date_col])
+        try:
+            df[date_col] = pd.to_datetime(df[date_col], dayfirst=True)
+        except Exception:
+            df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)
     return df
 
@@ -85,6 +88,12 @@ def bootstrap_diff(pre, camp, n_boot=2000):
 
 
 def ols_with_controls(y, X):
+    # Convert to pandas if needed
+    if isinstance(y, np.ndarray):
+        y = pd.Series(y)
+    if isinstance(X, np.ndarray):
+        X = pd.DataFrame(X)
+    
     # Ensure all inputs are numeric and handle any remaining issues
     y_clean = pd.to_numeric(y, errors='coerce')
     X_clean = X.apply(pd.to_numeric, errors='coerce')
@@ -261,7 +270,7 @@ with tabs[0]:
     fig.update_layout(yaxis=dict(title='Search Volume'), yaxis2=dict(title='Spend (INR)', overlaying='y', side='right'), legend=dict(orientation='h'))
     if start_idx is not None:
         fig.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.1, layer='below', line_width=0)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 # Pre vs Campaign
 with tabs[1]:
@@ -281,7 +290,7 @@ with tabs[1]:
         lower, upper, mean_diff = bootstrap_diff(np.array(pre), np.array(camp))
         st.write(f'Bootstrap mean diff (campaign - pre): {mean_diff:.2f}; 95% CI = [{lower:.2f}, {upper:.2f}]')
 
-        st.plotly_chart(px.box(pd.DataFrame({'pre':pre, 'campaign':camp}).melt(var_name='period', value_name='value'), x='period', y='value', points='all'), use_container_width=True)
+        st.plotly_chart(px.box(pd.DataFrame({'pre':pre, 'campaign':camp}).melt(var_name='period', value_name='value'), x='period', y='value', points='all'), width='stretch')
 
 # ITS / Regression
 with tabs[2]:
@@ -305,7 +314,7 @@ with tabs[2]:
     for c in controls:
         X[c] = DF[c].values
 
-    y = DF[outcome].values
+    y = DF[outcome]  # Keep as Series, not .values
 
     model = ols_with_controls(y, X)
     st.subheader('Model summary (HAC SE)')
@@ -328,7 +337,7 @@ with tabs[2]:
     fig2.add_trace(go.Scatter(x=DF['Date'], y=DF['fitted'], name='Fitted'))
     if start_idx is not None:
         fig2.add_vrect(x0=DF.loc[start_idx,'Date'], x1=DF.loc[end_idx,'Date'], fillcolor='green', opacity=0.08, layer='below', line_width=0)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
 # DiD & Controls
 with tabs[3]:
@@ -359,7 +368,7 @@ with tabs[4]:
     if len(corr_cols) > 1:
         corr_df = DF[corr_cols].corr()
         st.dataframe(corr_df)
-        st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), use_container_width=True)
+        st.plotly_chart(px.imshow(corr_df, text_auto=True, aspect='auto'), width='stretch')
 
     st.subheader('Cross-correlation (lag) between Spend and Outcome)')
     maxlag = int(max_lag)

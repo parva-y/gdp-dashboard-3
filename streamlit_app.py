@@ -27,9 +27,22 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-st.set_page_config(page_title='HDFC Sky Lift Analyzer', layout='wide')
+st.set_page_config(page_title="HDFC Sky – Search Lift", layout="wide")
 
-st.title('HDFC Sky — Branding Lift & Attribution Analyzer')
+# ---- Logo + Title header ----
+logo_path = "move.png"  # <-- put your actual logo file name here
+
+header_col1, header_col2 = st.columns([1, 6])
+
+with header_col1:
+    try:
+        st.image(logo_path, use_column_width=True)
+    except Exception:
+        st.write("")  # fail silently if logo not found
+
+with header_col2:
+    st.markdown("## HDFC Sky – Search Lift")
+
 st.markdown("""
 This app:
 - Ingests daily search volumes, campaign daily spends, and market indicators.

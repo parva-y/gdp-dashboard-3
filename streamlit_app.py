@@ -146,8 +146,8 @@ st.sidebar.header('Data inputs')
 searches_file = st.sidebar.file_uploader('Upload searches file (Excel with Date + columns)', type=['xlsx','xls','csv'])
 spends_file = st.sidebar.file_uploader('Upload spends file (CSV with Date, Spend)', type=['csv','xlsx','xls'])
 
-default_search_path = '/mnt/data/Searches Last 90 Days.xlsx'
-default_spend_path = '/mnt/data/Spends.csv'
+default_search_path = 'Searches Last 90 Days.xlsx'
+default_spend_path = 'Spends.csv'
 
 use_defaults = False
 if searches_file is None and spends_file is None:
